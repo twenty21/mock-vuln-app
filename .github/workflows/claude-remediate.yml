@@ -1,0 +1,272 @@
+name: Claude Code Security Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      trigger_source:
+        description: "What triggered this run (semgrep-scan / manual)"
+        required: false
+        default: "manual"
+      run_id:
+        description: "Semgrep scan run ID to pull findings from (optional)"
+        required: false
+        default: ""
+      severity_filter:
+        description: "Only fix findings at this severity or above"
+        required: false
+        default: "ERROR"
+        type: choice
+        options:
+          - ERROR
+          - WARNING
+          - INFO
+
+jobs:
+  remediate:
+    name: Claude Code Remediation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # To push fix branches
+      pull-requests: write  # To open PRs
+      issues: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Semgrep to get fresh findings
+        run: |
+          semgrep \
+            --config semgrep.yml \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output semgrep-findings.json \
+            . || true
+
+          python3 - << 'EOF'
+          import json, sys
+
+          with open("semgrep-findings.json") as f:
+              data = json.load(f)
+
+          severity_filter = "${{ inputs.severity_filter }}"
+          severity_rank = {"ERROR": 3, "WARNING": 2, "INFO": 1}
+          min_rank = severity_rank.get(severity_filter, 3)
+
+          filtered = [
+              r for r in data.get("results", [])
+              if severity_rank.get(r.get("extra", {}).get("severity", "INFO"), 0) >= min_rank
+          ]
+
+          print(f"Total findings: {len(data.get('results', []))}")
+          print(f"Findings at {severity_filter}+: {len(filtered)}")
+
+          with open("filtered-findings.json", "w") as f:
+              json.dump({"results": filtered}, f, indent=2)
+
+          with open("finding_count.txt", "w") as f:
+              f.write(str(len(filtered)))
+          EOF
+
+      - name: Generate remediation prompt
+        run: |
+          python3 - << 'EOF'
+          import json
+
+          with open("filtered-findings.json") as f:
+              data = json.load(f)
+
+          results = data.get("results", [])
+          if not results:
+              print("No findings to remediate.")
+              with open("remediation_prompt.txt", "w") as f:
+                  f.write("No security findings require remediation at this time.")
+              exit(0)
+
+          # Group findings by file
+          by_file = {}
+          for r in results:
+              filepath = r.get("path", "unknown")
+              if filepath not in by_file:
+                  by_file[filepath] = []
+              by_file[filepath].append(r)
+
+          prompt = """You are a security engineer remediating vulnerabilities found by Semgrep SAST scanning.
+
+          TASK: Fix ALL security findings listed below. For each finding:
+          1. Read the affected file
+          2. Apply the minimal, correct fix that resolves the vulnerability
+          3. Do NOT change unrelated code
+          4. Preserve existing functionality
+          5. Add a brief inline comment explaining the fix
+
+          FINDINGS TO REMEDIATE:
+          """
+
+          for filepath, findings in by_file.items():
+              prompt += f"\n\n## File: {filepath}\n"
+              for i, r in enumerate(findings, 1):
+                  line = r.get("start", {}).get("line", "?")
+                  rule_id = r.get("check_id", "unknown")
+                  message = r.get("extra", {}).get("message", "").strip()
+                  severity = r.get("extra", {}).get("severity", "UNKNOWN")
+                  code_snippet = r.get("extra", {}).get("lines", "").strip()
+                  fix_hint = r.get("extra", {}).get("metadata", {}).get("fix", "")
+
+                  prompt += f"""
+          Finding {i}: [{severity}] {rule_id}
+          - Line: {line}
+          - Issue: {message}
+          - Vulnerable code: {code_snippet}
+          """
+                  if fix_hint:
+                      prompt += f"          - Suggested fix: {fix_hint}\n"
+
+          prompt += """
+
+          CONSTRAINTS:
+          - Use parameterized queries for all SQL injection fixes
+          - Replace hardcoded secrets with os.environ.get() / process.env calls and add a comment with the expected env var name
+          - Replace shell=True subprocess calls with shell=False + list arguments
+          - Replace pickle with json for deserialization
+          - Replace md5/sha1 password hashing with bcrypt or hashlib.scrypt
+          - Replace yaml.load with yaml.safe_load
+          - Remove eval() and implement logic explicitly
+          - Remove 'none' from JWT algorithm lists
+          - Add hasOwnProperty checks for prototype pollution fixes
+
+          After making all fixes, create a brief summary of changes made.
+          """
+
+          with open("remediation_prompt.txt", "w") as f:
+              f.write(prompt)
+
+          print(f"Generated prompt for {len(results)} findings across {len(by_file)} files")
+          EOF
+
+      - name: Create remediation branch
+        run: |
+          BRANCH="fix/claude-security-remediation-$(date +%Y%m%d-%H%M%S)"
+          echo "BRANCH_NAME=$BRANCH" >> $GITHUB_ENV
+          git checkout -b "$BRANCH"
+          git config user.name "Claude Code"
+          git config user.email "claude-code[bot]@users.noreply.github.com"
+
+      - name: Run Claude Code to fix findings
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          COUNT=$(cat finding_count.txt)
+          if [ "$COUNT" = "0" ]; then
+            echo "No findings to remediate. Skipping Claude Code."
+            echo "FINDINGS_COUNT=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "FINDINGS_COUNT=$COUNT" >> $GITHUB_ENV
+
+          # Run Claude Code with the remediation prompt
+          claude \
+            --print \
+            --allowedTools "Read,Edit,Write,Bash" \
+            "$(cat remediation_prompt.txt)" \
+            > claude_output.txt 2>&1
+
+          echo "Claude Code output:"
+          cat claude_output.txt
+
+      - name: Verify fixes with Semgrep re-scan
+        if: env.FINDINGS_COUNT != '0'
+        run: |
+          semgrep \
+            --config semgrep.yml \
+            --config "p/owasp-top-ten" \
+            --json \
+            --output semgrep-post-fix.json \
+            . || true
+
+          python3 - << 'EOF'
+          import json
+
+          with open("semgrep-findings.json") as f:
+              before = json.load(f)
+          with open("semgrep-post-fix.json") as f:
+              after = json.load(f)
+
+          before_count = len(before.get("results", []))
+          after_count = len(after.get("results", []))
+          fixed_count = before_count - after_count
+
+          print(f"Before: {before_count} findings")
+          print(f"After:  {after_count} findings")
+          print(f"Fixed:  {fixed_count} findings")
+
+          with open("fix_summary.txt", "w") as f:
+              f.write(f"Fixed {fixed_count} of {before_count} findings.\n")
+              f.write(f"Remaining: {after_count} findings.\n")
+          EOF
+
+      - name: Commit and push fixes
+        if: env.FINDINGS_COUNT != '0'
+        run: |
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "fix(security): Claude Code auto-remediation of Semgrep findings
+
+          Automated security fix generated by Claude Code.
+          Trigger: ${{ inputs.trigger_source }}
+
+          $(cat fix_summary.txt 2>/dev/null || echo 'See workflow run for details.')"
+            git push origin "$BRANCH_NAME"
+          fi
+
+      - name: Open Pull Request
+        if: env.FINDINGS_COUNT != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SUMMARY=$(cat fix_summary.txt 2>/dev/null || echo "See workflow run for details.")
+          COUNT=$(cat finding_count.txt)
+
+          gh pr create \
+            --title "fix(security): Claude Code auto-remediation — $COUNT findings" \
+            --body "## Security Remediation by Claude Code
+
+          This PR was automatically generated by the **Claude Code Security Remediation** workflow.
+
+          ### Summary
+          $SUMMARY
+
+          ### Trigger
+          - Source: \`${{ inputs.trigger_source }}\`
+          - Severity filter: \`${{ inputs.severity_filter }}\` and above
+
+          ### Review Checklist
+          - [ ] Review each changed file for correctness
+          - [ ] Confirm no functionality was broken
+          - [ ] Run the test suite
+          - [ ] Re-run Semgrep to verify findings are resolved
+
+          > **Note:** This is an automated fix. Always review AI-generated security patches before merging.
+
+          ---
+          Generated by [Claude Code](https://claude.ai/claude-code)" \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --label "security,automated"

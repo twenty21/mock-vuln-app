@@ -1,0 +1,138 @@
+name: Semgrep Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run daily at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  semgrep:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # Required to upload SARIF results
+      issues: write           # Required to create issues for findings
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep (custom rules)
+        id: semgrep_custom
+        run: |
+          semgrep \
+            --config semgrep.yml \
+            --json \
+            --output semgrep-custom-results.json \
+            --error \
+            . || true
+
+      - name: Run Semgrep (OWASP Top 10 ruleset)
+        id: semgrep_owasp
+        run: |
+          semgrep \
+            --config "p/owasp-top-ten" \
+            --json \
+            --output semgrep-owasp-results.json \
+            . || true
+
+      - name: Run Semgrep (secrets detection)
+        id: semgrep_secrets
+        run: |
+          semgrep \
+            --config "p/secrets" \
+            --json \
+            --output semgrep-secrets-results.json \
+            . || true
+
+      - name: Merge all results
+        run: |
+          python3 - << 'EOF'
+          import json, glob, sys
+
+          all_results = {"results": [], "errors": []}
+          for f in glob.glob("semgrep-*-results.json"):
+              try:
+                  with open(f) as fh:
+                      data = json.load(fh)
+                      all_results["results"].extend(data.get("results", []))
+                      all_results["errors"].extend(data.get("errors", []))
+              except Exception as e:
+                  print(f"Warning: could not read {f}: {e}", file=sys.stderr)
+
+          with open("semgrep-all-results.json", "w") as out:
+              json.dump(all_results, out, indent=2)
+
+          count = len(all_results["results"])
+          print(f"Total findings: {count}")
+          with open("finding_count.txt", "w") as f:
+              f.write(str(count))
+          EOF
+
+      - name: Upload findings as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-findings
+          path: |
+            semgrep-all-results.json
+            semgrep-custom-results.json
+            semgrep-owasp-results.json
+            semgrep-secrets-results.json
+          retention-days: 30
+
+      - name: Print summary
+        run: |
+          COUNT=$(cat finding_count.txt)
+          echo "## Semgrep Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total findings: $COUNT**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 - << 'EOF'
+          import json, os
+
+          with open("semgrep-all-results.json") as f:
+              data = json.load(f)
+
+          severity_counts = {}
+          for r in data.get("results", []):
+              sev = r.get("extra", {}).get("severity", "UNKNOWN")
+              severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("| Severity | Count |\n")
+              f.write("|----------|-------|\n")
+              for sev, count in sorted(severity_counts.items()):
+                  f.write(f"| {sev} | {count} |\n")
+              f.write("\n")
+              f.write("Run the **Claude Code Remediation** workflow to auto-fix findings.\n")
+          EOF
+
+      - name: Trigger remediation workflow (on push to main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'claude-remediate.yml',
+              ref: 'main',
+              inputs: {
+                trigger_source: 'semgrep-scan',
+                run_id: context.runId.toString()
+              }
+            });

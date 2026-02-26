@@ -1,0 +1,211 @@
+# Semgrep configuration for VulnFlask + VulnExpress
+# Runs OWASP Top 10 focused rules across Python and Node.js
+
+rules:
+  # ── Python Rules ─────────────────────────────────────────────────────────────
+
+  - id: python-sql-injection-string-format
+    patterns:
+      - pattern: |
+          $CONN.execute(f"... {$VAR} ...")
+      - pattern: |
+          $CONN.execute("..." + $VAR + "...")
+      - pattern: |
+          $CONN.execute("..." % $VAR)
+    message: |
+      SQL Injection: User-controlled variable '$VAR' is interpolated directly into
+      a SQL query. Use parameterized queries with placeholders (?) instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-89
+      owasp: A03:2021 – Injection
+      fix: Use parameterized queries: cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+
+  - id: python-hardcoded-secret
+    patterns:
+      - pattern: $KEY = "..."
+        metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)(password|secret|api_key|token|aws_secret|jwt_secret|db_pass)
+    message: |
+      Hardcoded secret detected in variable '$KEY'. Store secrets in environment
+      variables or a secrets manager, never in source code.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-798
+      owasp: A02:2021 – Cryptographic Failures
+
+  - id: python-subprocess-shell-true
+    pattern: subprocess.check_output(..., shell=True, ...)
+    message: |
+      Command Injection risk: subprocess called with shell=True and potentially
+      unsanitized input. Use shell=False and pass a list of arguments instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021 – Injection
+
+  - id: python-pickle-loads
+    pattern: pickle.loads($DATA)
+    message: |
+      Insecure Deserialization: pickle.loads() on untrusted data can lead to
+      arbitrary code execution. Use a safe format like JSON instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021 – Software and Data Integrity Failures
+
+  - id: python-md5-password-hash
+    patterns:
+      - pattern: hashlib.md5($PASSWORD.encode()).hexdigest()
+      - pattern: hashlib.md5(...).hexdigest()
+    message: |
+      Weak Cryptography: MD5 is cryptographically broken and unsuitable for
+      password hashing. Use bcrypt, argon2, or hashlib.scrypt() instead.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-916
+      owasp: A02:2021 – Cryptographic Failures
+
+  - id: python-yaml-unsafe-load
+    pattern: yaml.load($DATA)
+    message: |
+      Unsafe YAML loading: yaml.load() without a Loader can execute arbitrary
+      Python code. Use yaml.safe_load() instead.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: CWE-502
+      owasp: A08:2021 – Software and Data Integrity Failures
+
+  - id: python-flask-debug-true
+    pattern: app.run(..., debug=True, ...)
+    message: |
+      Flask debug mode is enabled. This exposes an interactive debugger and
+      should never be used in production.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: CWE-489
+      owasp: A05:2021 – Security Misconfiguration
+
+  # ── JavaScript / Node.js Rules ───────────────────────────────────────────────
+
+  - id: js-eval-user-input
+    patterns:
+      - pattern: eval($INPUT)
+      - pattern: eval(req.body.$FIELD)
+      - pattern: eval(req.query.$FIELD)
+    message: |
+      Code Injection: eval() with user-controlled input allows arbitrary code
+      execution. Remove eval() and implement the logic explicitly.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-94
+      owasp: A03:2021 – Injection
+
+  - id: js-sql-injection-concatenation
+    patterns:
+      - pattern: |
+          $DB.run(`... ${$VAR} ...`)
+      - pattern: |
+          $DB.get(`... ${$VAR} ...`)
+      - pattern: |
+          $DB.all(`... ${$VAR} ...`)
+    message: |
+      SQL Injection: Template literal used to build SQL query with variable '$VAR'.
+      Use parameterized queries with ? placeholders instead.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-89
+      owasp: A03:2021 – Injection
+
+  - id: js-hardcoded-secret
+    patterns:
+      - pattern: const $KEY = "..."
+        metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)(password|secret|api_key|token|jwt_secret|stripe_key|db_pass)
+      - pattern: let $KEY = "..."
+        metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)(password|secret|api_key|token|jwt_secret|stripe_key|db_pass)
+    message: |
+      Hardcoded secret in '$KEY'. Store secrets in environment variables
+      (process.env.SECRET_NAME) or a secrets manager.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-798
+      owasp: A02:2021 – Cryptographic Failures
+
+  - id: js-exec-user-input
+    patterns:
+      - pattern: exec(req.query.$CMD, ...)
+      - pattern: exec(req.body.$CMD, ...)
+      - pattern: exec($CMD, ...)
+        metavariable-pattern:
+          metavariable: $CMD
+          pattern: req.$OBJ.$FIELD
+    message: |
+      Command Injection: child_process.exec() with user input allows arbitrary
+      OS command execution. Validate and allowlist inputs, or use execFile()
+      with a hardcoded command path.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-78
+      owasp: A03:2021 – Injection
+
+  - id: js-xss-res-send-user-input
+    patterns:
+      - pattern: |
+          const $HTML = `...${ $REQ.query.$PARAM }...`;
+          $RES.send($HTML);
+      - pattern: |
+          const $HTML = `...${ $REQ.body.$PARAM }...`;
+          $RES.send($HTML);
+    message: |
+      Cross-Site Scripting (XSS): User input from '$PARAM' is embedded directly
+      in HTML without sanitization. Use a templating engine with auto-escaping
+      (e.g., Handlebars, EJS with <%=) or sanitize with DOMPurify.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-79
+      owasp: A03:2021 – Injection
+
+  - id: js-jwt-algorithm-none
+    pattern: jwt.verify($TOKEN, $SECRET, { algorithms: [..., "none", ...] })
+    message: |
+      JWT Algorithm Confusion: 'none' algorithm in the allowed list allows
+      signature bypass. Remove 'none' and pin to a specific algorithm like
+      ["HS256"].
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: CWE-347
+      owasp: A02:2021 – Cryptographic Failures
+
+  - id: js-prototype-pollution
+    patterns:
+      - pattern: |
+          for (let $KEY in $SOURCE) {
+            $TARGET[$KEY] = $SOURCE[$KEY];
+          }
+    message: |
+      Potential Prototype Pollution: iterating over object keys without checking
+      hasOwnProperty or filtering __proto__ and constructor can lead to prototype
+      pollution. Use Object.hasOwn($SOURCE, $KEY) check or structuredClone().
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: CWE-1321
+      owasp: A08:2021 – Software and Data Integrity Failures

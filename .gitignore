@@ -1,0 +1,11 @@
+.env
+*.pyc
+__pycache__/
+node_modules/
+.DS_Store
+*.json.bak
+semgrep-*.json
+filtered-findings.json
+claude_output.txt
+fix_summary.txt
+finding_count.txt

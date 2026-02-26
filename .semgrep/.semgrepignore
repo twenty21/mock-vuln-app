@@ -1,0 +1,11 @@
+# Semgrep ignore file
+node_modules/
+.git/
+dist/
+build/
+*.min.js
+*.lock
+test/
+__pycache__/
+*.pyc
+.env
